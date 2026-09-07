@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: kalshi-capstone-dashboard
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --chdir dashboard app:server --workers 1 --threads 8 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: STOCK_DATA_OFFLINE
+        value: "1"
