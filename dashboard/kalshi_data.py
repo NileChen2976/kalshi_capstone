@@ -39,8 +39,9 @@ def kalshi_tickers() -> list[str]:
 
 def kalshi_daily(ticker: str = DEFAULT_KALSHI_TICKER) -> pd.DataFrame:
     df = _daily_all()
-    df = df[df["ticker"] == ticker]
-    return df.sort_values("date")[DAILY_COLS].reset_index(drop=True)
+    df = df[df["ticker"] == ticker].sort_values("date")
+    df = df.drop_duplicates("date", keep="last")     # repeated downloads can leave duplicate day rows
+    return df[DAILY_COLS].reset_index(drop=True)
 
 
 def _read_day(kind: str, ticker: str, day: str, time_col: str) -> pd.DataFrame:

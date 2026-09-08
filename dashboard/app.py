@@ -1,497 +1,54 @@
 # -*- coding: utf-8 -*-
 """
-app.py -- Kalshi contracts x S&P 500 stocks dashboard (Plotly Dash)
+app.py -- Kalshi contracts x S&P 500 dashboard (Plotly Dash), three tabs:
 
-Panel A  Daily view. Left axis: Kalshi mid with the bid/ask band. Right axis: one stock's
-         backward-adjusted close. Range slider at the bottom. Pick the Kalshi contract from a
-         dropdown; pick the stock by typing a ticker or paging Prev/Next through the S&P 500
-         (optionally within one GICS sector). Clicking a day in panel A moves panel B to that day.
-Event    Event-window statistics: days when the Kalshi contract moved more than +-k% vs. the
-         stock's big moves in a +-K trading-day window. Click an event row: panel A zooms to it,
-         panel B jumps to that day.
-Panel B  Intraday view of one ET day: 1-min mid/bid/ask step lines, trades as dots (size =
-         contracts, colour = taker side), 1-min volume. Wheel to zoom, drag to pan. Prev/Next day,
-         prev/next day with trades. The trade table follows the visible range; clicking a row
-         centres the chart on that trade.
+  Event pair (D vs R)   the two binary contracts of one event in D terms, cross-book checks,
+                        merged trade flow                                          -> tab_pair.py
+  Stocks x Kalshi       one stock vs several Kalshi series, closeness table, event-window
+                        statistics, intraday view of one contract                  -> tab_stock.py
+  Live books            order books of every contract refreshed every 10 s from the local
+                        collector (run  python live_collector.py  separately)      -> tab_live.py
 
 Run locally:   python app.py  ->  http://127.0.0.1:8050
-Hosted:        gunicorn --chdir dashboard app:server   (see ../render.yaml)
+Hosted:        gunicorn --chdir dashboard app:server   (see ../render.yaml; the Live tab needs the collector)
 """
 from __future__ import annotations
 
-import bisect
 import os
-from datetime import date, timedelta
 
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, Patch, ctx, dash_table, dcc, html, no_update
-from plotly.subplots import make_subplots
+from dash import Dash, dcc, html
 
-from event_study import describe, run_event_study
-from kalshi_data import DEFAULT_KALSHI_TICKER, all_days, kalshi_1min, kalshi_daily, kalshi_tickers, kalshi_trades, trade_days
-from stock_data import get_stock_daily, load_universe, normalize_ticker, universe_info
+import tab_live
+import tab_pair
+import tab_replay
+import tab_stock
 
-# ----------------------------------------------------------------------------- data
-UNI = load_universe()                                   # ticker, name, sector
-SECTORS = sorted(UNI["sector"].dropna().unique().tolist())
-KALSHI_TICKERS = kalshi_tickers()
-DEFAULT_TICKER = "AAPL"
-ALL_SECTORS = "ALL"
-_ALL_DAYS = sorted({d for k in KALSHI_TICKERS for d in all_days(k)})
-DAY_MIN, DAY_MAX = _ALL_DAYS[0], _ALL_DAYS[-1]
-
-
-def universe_list(sector: str | None) -> list[str]:
-    if not sector or sector == ALL_SECTORS:
-        return UNI["ticker"].tolist()
-    return UNI.loc[UNI["sector"] == sector, "ticker"].tolist()
-
-
-def default_day(kalshi_ticker: str) -> str:
-    td = trade_days(kalshi_ticker)
-    return td[-1] if td else all_days(kalshi_ticker)[-1]
-
-
-# ----------------------------------------------------------------------------- colours
-C_KALSHI, C_STOCK = "#1f77b4", "#d62728"
-C_UP, C_DOWN, C_BASE, C_TEXT = "#e34948", "#2a78d6", "#8a8987", "#52514e"   # event chart: diverging pair + neutral
-
-
-# ----------------------------------------------------------------------------- figures
-def build_fig_a(ticker: str, kalshi_ticker: str):
-    kd = kalshi_daily(kalshi_ticker)
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    x = kd["date"]
-    fig.add_trace(go.Scatter(x=x, y=kd["yes_ask_close"], line=dict(width=0), showlegend=False, hoverinfo="skip"))
-    fig.add_trace(go.Scatter(x=x, y=kd["yes_bid_close"], name="bid/ask band", fill="tonexty",
-                             fillcolor="rgba(31,119,180,0.18)", line=dict(width=0), hoverinfo="skip"))
-    fig.add_trace(go.Scatter(
-        x=x, y=kd["mid_close"], name=f"{kalshi_ticker} mid", line=dict(color=C_KALSHI, width=1.6),
-        customdata=kd[["yes_bid_close", "yes_ask_close", "volume"]].to_numpy(),
-        hovertemplate="mid %{y:.3f}  (bid %{customdata[0]:.3f} / ask %{customdata[1]:.3f})  vol %{customdata[2]:,.0f}<extra></extra>",
-    ))
-    err = None
-    try:
-        s = get_stock_daily(ticker)
-        fig.add_trace(go.Scatter(
-            x=s["date"], y=s["close_hfq"], name=f"{ticker} close (backward-adjusted)", line=dict(color=C_STOCK, width=1.6),
-            customdata=s[["close", "volume"]].to_numpy(),
-            hovertemplate="adj %{y:.2f}  (raw close %{customdata[0]:.2f}, vol %{customdata[1]:,.0f})<extra>" + ticker + "</extra>",
-        ), secondary_y=True)
-    except Exception as e:  # noqa: BLE001
-        err = str(e)
-    fig.update_layout(
-        height=430, margin=dict(l=55, r=55, t=30, b=20), hovermode="x unified",
-        legend=dict(orientation="h", y=1.08, x=0),
-        xaxis=dict(type="date", rangeslider=dict(visible=True, thickness=0.07)),
-        uirevision="A",
-    )
-    fig.update_yaxes(title_text="P(yes)", secondary_y=False)
-    fig.update_yaxes(title_text=f"{ticker} adjusted close ($)", secondary_y=True)
-    return fig, err, kd
-
-
-def build_fig_b(kalshi_ticker: str, day: str):
-    m = kalshi_1min(kalshi_ticker, day)
-    t = kalshi_trades(kalshi_ticker, day)
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.76, 0.24], vertical_spacing=0.03)
-    if not m.empty:
-        fig.add_trace(go.Scatter(x=m["t"], y=m["yes_ask_close"], name="ask",
-                                 line=dict(color="rgba(214,39,40,0.55)", width=1, shape="hv")), row=1, col=1)
-        fig.add_trace(go.Scatter(x=m["t"], y=m["yes_bid_close"], name="bid",
-                                 line=dict(color="rgba(44,160,44,0.55)", width=1, shape="hv")), row=1, col=1)
-        fig.add_trace(go.Scatter(x=m["t"], y=m["mid_close"], name="mid",
-                                 line=dict(color=C_KALSHI, width=1.6, shape="hv")), row=1, col=1)
-        fig.add_trace(go.Bar(x=m["t"], y=m["volume"], name="1-min volume",
-                             marker_color="rgba(110,110,110,0.65)"), row=2, col=1)
-    if not t.empty:
-        size = np.clip(4 + 2.2 * np.log1p(t["count"].to_numpy()), 4, 18)
-        for side, color, label in (("yes", "#2ca02c", "taker buys yes"), ("no", "#d62728", "taker buys no")):
-            g = t[t["taker_side"] == side]
-            if g.empty:
-                continue
-            fig.add_trace(go.Scatter(
-                x=g["t"], y=g["yes_price"], mode="markers", name=label,
-                marker=dict(color=color, size=size[g.index], line=dict(width=0.5, color="white"), opacity=0.85),
-                customdata=g[["count", "no_price", "taker_book_side", "trade_id"]].to_numpy(),
-                hovertemplate="%{x|%H:%M:%S.%L}  yes %{y:.3f} / no %{customdata[1]:.3f}<br>"
-                              "contracts %{customdata[0]:,.2f}  book %{customdata[2]}<br>%{customdata[3]}<extra>" + label + "</extra>",
-            ), row=1, col=1)
-    if m.empty and t.empty:
-        fig.add_annotation(text=f"No data for {kalshi_ticker} on {day}", x=0.5, y=0.5, xref="paper", yref="paper",
-                           showarrow=False, font=dict(size=16))
-    d0 = pd.Timestamp(day)
-    fig.update_layout(
-        height=520, margin=dict(l=55, r=20, t=30, b=20), hovermode="closest", dragmode="pan",
-        legend=dict(orientation="h", y=1.06, x=0), bargap=0,
-    )
-    # with shared_xaxes the top x-axis "matches" the bottom one; the range must be set on both
-    fig.update_xaxes(range=[d0, d0 + pd.Timedelta(days=1)])
-    fig.update_yaxes(title_text="P(yes)", row=1, col=1)
-    fig.update_yaxes(title_text="contracts", row=2, col=1)
-    fig.update_xaxes(title_text="ET", row=2, col=1)
-    return fig, m, t
-
-
-def build_fig_events(summary: pd.DataFrame, s_thr: float) -> go.Figure:
-    fig = go.Figure()
-    if summary is None or summary.empty:
-        fig.add_annotation(text="No events", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
-        return fig
-    x = [f"{int(o):+d}" for o in summary["offset"]]
-    for col, name, color, ncol, mcol in (("hit_up", "Kalshi up events", C_UP, "n_up", "mean_ret_up"),
-                                         ("hit_down", "Kalshi down events", C_DOWN, "n_down", "mean_ret_down")):
-        fig.add_trace(go.Bar(
-            x=x, y=summary[col], name=name, marker_color=color, marker_line_width=0,
-            customdata=np.c_[summary[ncol], summary[mcol]],
-            hovertemplate="offset %{x} days<br>share with stock |r| ≥ " + f"{s_thr:.1%}" +
-                          ": %{y:.1%}<br>events %{customdata[0]}  mean return %{customdata[1]:+.2%}<extra>%{fullData.name}</extra>",
-        ))
-    base = float(summary["baseline"].iloc[0])
-    fig.add_hline(y=base, line=dict(color=C_BASE, width=2, dash="dash"),
-                  annotation_text=f"unconditional baseline {base:.1%}", annotation_position="top right",
-                  annotation_font=dict(color=C_TEXT, size=11))
-    fig.update_layout(
-        height=300, margin=dict(l=55, r=20, t=30, b=40), barmode="group", bargap=0.35, bargroupgap=0.08,
-        legend=dict(orientation="h", y=1.12, x=0), plot_bgcolor="#fcfcfb", paper_bgcolor="white",
-        font=dict(color=C_TEXT),
-    )
-    fig.update_xaxes(title_text="trading-day offset from the event day", showgrid=False)
-    fig.update_yaxes(title_text="share of events with a big stock move", tickformat=".0%", gridcolor="#eeeeea", rangemode="tozero")
-    return fig
-
-
-# ----------------------------------------------------------------------------- tables
-def table_rows(t: pd.DataFrame) -> list[dict]:
-    if t.empty:
-        return []
-    out = pd.DataFrame({
-        "id": t["trade_id"],
-        "ts": t["t"].astype(str),
-        "time": t["t"].dt.strftime("%H:%M:%S.%f").str[:-3],
-        "yes_price": t["yes_price"], "no_price": t["no_price"],
-        "count": t["count"].round(2), "taker_side": t["taker_side"],
-        "taker_book_side": t["taker_book_side"], "yes_notional": t["yes_notional"].round(2),
-    })
-    return out.to_dict("records")
-
-
-TRADE_COLS = [
-    {"name": "Time (ET)", "id": "time"}, {"name": "Yes px", "id": "yes_price"}, {"name": "No px", "id": "no_price"},
-    {"name": "Contracts", "id": "count"}, {"name": "Taker", "id": "taker_side"}, {"name": "Book side", "id": "taker_book_side"},
-    {"name": "Yes notional $", "id": "yes_notional"},
-]
-
-
-def event_table_columns(K: int) -> list[dict]:
-    cols = [{"name": "Date", "id": "date"}, {"name": "Dir", "id": "direction"},
-            {"name": "Mid before", "id": "kalshi_prev"}, {"name": "Mid after", "id": "kalshi_mid"},
-            {"name": "Kalshi ret", "id": "kalshi_ret", "type": "numeric", "format": {"specifier": "+.1%"}}]
-    for o in range(-K, K + 1):
-        cols.append({"name": f"Stock r {o:+d}", "id": f"ret_{o:+d}", "type": "numeric", "format": {"specifier": "+.2%"}})
-    cols += [{"name": "Big move in window", "id": "any_big_in_window"},
-             {"name": "Window max |r|", "id": "max_abs_ret", "type": "numeric", "format": {"specifier": ".2%"}}]
-    return cols
-
-
-SUMMARY_COLS = [
-    {"name": "Offset", "id": "offset"},
-    {"name": "Up n", "id": "n_up"}, {"name": "Up hit rate", "id": "hit_up", "type": "numeric", "format": {"specifier": ".1%"}},
-    {"name": "Up mean r", "id": "mean_ret_up", "type": "numeric", "format": {"specifier": "+.2%"}},
-    {"name": "Down n", "id": "n_down"}, {"name": "Down hit rate", "id": "hit_down", "type": "numeric", "format": {"specifier": ".1%"}},
-    {"name": "Down mean r", "id": "mean_ret_down", "type": "numeric", "format": {"specifier": "+.2%"}},
-    {"name": "All hit rate", "id": "hit_all", "type": "numeric", "format": {"specifier": ".1%"}},
-    {"name": "Baseline", "id": "baseline", "type": "numeric", "format": {"specifier": ".1%"}},
-    {"name": "Lift", "id": "lift_all", "type": "numeric", "format": {"specifier": ".2f"}},
-]
-TABLE_STYLE = dict(style_cell={"fontSize": "12px", "padding": "2px 6px", "textAlign": "right"},
-                   style_header={"fontWeight": "bold", "backgroundColor": "#f2f2f2"})
-
-# ----------------------------------------------------------------------------- layout
 app = Dash(__name__)
 app.title = "Kalshi x S&P 500"
 server = app.server            # for gunicorn
-BTN = {"marginRight": "6px", "padding": "4px 10px"}
-ROW = {"display": "flex", "alignItems": "center", "gap": "6px", "margin": "6px 0", "flexWrap": "wrap"}
-NOTE = {"fontSize": "12px", "color": "#555", "margin": "4px 0"}
 
 app.layout = html.Div(style={"fontFamily": "Segoe UI, Arial", "padding": "8px 16px"}, children=[
     html.H3("Kalshi contracts  ×  S&P 500 stocks", style={"margin": "4px 0 8px"}),
-
-    html.Div(style=ROW, children=[
-        html.B("Kalshi contract:"),
-        dcc.Dropdown(id="kalshi-ticker", options=[{"label": k, "value": k} for k in KALSHI_TICKERS],
-                     value=DEFAULT_KALSHI_TICKER, clearable=False, style={"width": "220px"}),
-        html.B("Stock:", style={"marginLeft": "16px"}),
-        dcc.Input(id="ticker-input", value=DEFAULT_TICKER, debounce=True, placeholder="ticker, then Enter",
-                  style={"width": "110px", "textTransform": "uppercase"}),
-        html.Button("Go", id="go", n_clicks=0, style=BTN),
-        html.B("Sector:"),
-        dcc.Dropdown(id="sector", options=[{"label": "All sectors", "value": ALL_SECTORS}] +
-                     [{"label": s, "value": s} for s in SECTORS],
-                     value=ALL_SECTORS, clearable=False, style={"width": "240px"}),
-        html.Button("◀ Prev", id="prev-t", n_clicks=0, style=BTN),
-        html.Button("Next ▶", id="next-t", n_clicks=0, style=BTN),
-        html.Span(id="ticker-pos", style={"color": "#555"}),
+    dcc.Tabs(id="tabs", value="pair", children=[
+        dcc.Tab(label="Event pair (D vs R)", value="pair", children=tab_pair.layout()),
+        dcc.Tab(label="Stocks × Kalshi", value="stock", children=tab_stock.layout()),
+        dcc.Tab(label="Live books", value="live", children=tab_live.layout()),
+        dcc.Tab(label="Replay", value="replay", children=tab_replay.layout()),
     ]),
-    html.Div(id="ticker-info", style={"fontSize": "14px", "fontWeight": "bold", "margin": "2px 0"}),
-    html.Div(id="a-status", style=NOTE),
-    dcc.Graph(id="fig-a", config={"displaylogo": False}),
-
-    html.Hr(),
-    # ------------------------------------------------------------------ event-window statistics
-    html.Div(style=ROW, children=[
-        html.B("Event windows:"),
-        html.Span("Kalshi move threshold ±"),
-        dcc.Input(id="k-thr", type="number", value=3, min=0.1, step=0.5, debounce=True, style={"width": "60px"}), html.Span("%"),
-        dcc.RadioItems(id="k-mode", value="pct", inline=True,
-                       options=[{"label": "relative return", "value": "pct"}, {"label": "probability points", "value": "pp"}],
-                       style={"marginLeft": "6px"}),
-        html.Span("Stock |r| ≥", style={"marginLeft": "12px"}),
-        dcc.Input(id="s-thr", type="number", value=3, min=0.1, step=0.5, debounce=True, style={"width": "60px"}), html.Span("%"),
-        html.Span("Window ±", style={"marginLeft": "12px"}),
-        dcc.Input(id="win-k", type="number", value=2, min=1, max=10, step=1, debounce=True, style={"width": "50px"}),
-        html.Span("trading days"),
-    ]),
-    html.Pre(id="ev-text", style={"fontSize": "12px", "color": "#333", "margin": "4px 0", "whiteSpace": "pre-wrap"}),
-    html.Div(style={"display": "flex", "gap": "12px"}, children=[
-        dcc.Graph(id="fig-ev", config={"displaylogo": False}, style={"flex": "2", "minWidth": 0}),
-        html.Div(style={"flex": "3", "minWidth": 0}, children=[
-            html.Div("Per offset: hit rate = share of events whose stock |r| exceeds the threshold on that day; "
-                     "lift = all-events hit rate / baseline", style=NOTE),
-            dash_table.DataTable(id="ev-summary", columns=SUMMARY_COLS, data=[], **TABLE_STYLE),
-        ]),
-    ]),
-    html.Div("Events — click a row: panel A zooms to the event, panel B jumps to that day. "
-             "Highlighted cells are stock returns beyond the threshold.", style=NOTE),
-    dash_table.DataTable(id="events-table", columns=[], data=[], page_size=10, page_action="native",
-                         sort_action="native", **TABLE_STYLE),
-    dcc.Store(id="events-store", data={"rows": []}),
-
-    html.Hr(),
-    # ------------------------------------------------------------------ intraday
-    html.Div(style=ROW, children=[
-        html.B("Intraday (ET day):"),
-        html.Button("◀ Prev day", id="prev-d", n_clicks=0, style=BTN),
-        dcc.DatePickerSingle(id="day", date=default_day(DEFAULT_KALSHI_TICKER), min_date_allowed=DAY_MIN,
-                             max_date_allowed=DAY_MAX, display_format="YYYY-MM-DD"),
-        html.Button("Next day ▶", id="next-d", n_clicks=0, style=BTN),
-        html.Button("◀ Prev day with trades", id="prev-td", n_clicks=0, style=BTN),
-        html.Button("Next day with trades ▶", id="next-td", n_clicks=0, style=BTN),
-        html.Span(id="day-info", style={"color": "#555"}),
-        html.Span("(wheel = zoom, drag = pan; click a day in panel A to jump)", style={"fontSize": "12px", "color": "#888"}),
-    ]),
-    html.Div(style={"display": "flex", "gap": "12px"}, children=[
-        dcc.Graph(id="fig-b", config={"scrollZoom": True, "displaylogo": False}, style={"flex": "3", "minWidth": 0}),
-        html.Div(style={"flex": "2", "minWidth": 0}, children=[
-            html.Div("Trades — filtered to the visible range; click a row to centre the chart on it", style=NOTE),
-            dash_table.DataTable(
-                id="trades-table", columns=TRADE_COLS, data=[], page_size=15, page_action="native",
-                sort_action="native", **TABLE_STYLE,
-                style_data_conditional=[
-                    {"if": {"filter_query": "{taker_side} = yes", "column_id": "taker_side"}, "color": "#2ca02c"},
-                    {"if": {"filter_query": "{taker_side} = no", "column_id": "taker_side"}, "color": "#d62728"},
-                ],
-            ),
-        ]),
-    ]),
-
-    dcc.Store(id="ticker-store", data=DEFAULT_TICKER),
-    dcc.Store(id="day-trades", data={"day": None, "rows": []}),
 ])
 
-
-# ----------------------------------------------------------------------------- callbacks: stock selection
-@app.callback(
-    Output("ticker-store", "data"), Output("ticker-pos", "children"), Output("ticker-input", "value"),
-    Output("ticker-info", "children"),
-    Input("go", "n_clicks"), Input("ticker-input", "n_submit"),
-    Input("prev-t", "n_clicks"), Input("next-t", "n_clicks"), Input("sector", "value"),
-    State("ticker-input", "value"), State("ticker-store", "data"),
-)
-def nav_ticker(_go, _sub, _prev, _next, sector, typed, current):
-    trig = ctx.triggered_id
-    cur = normalize_ticker(current or DEFAULT_TICKER)
-    lst = universe_list(sector)
-    if trig in ("go", "ticker-input"):
-        new = normalize_ticker(typed) or cur
-    elif trig in ("prev-t", "next-t"):
-        base = lst if cur in lst else sorted(set(lst) | {cur})
-        i = (base.index(cur) + (1 if trig == "next-t" else -1)) % len(base)
-        new = base[i]
-    elif trig == "sector":
-        new = cur if cur in lst else (lst[0] if lst else cur)
-    else:
-        new = cur
-    scope = "S&P 500" if not sector or sector == ALL_SECTORS else sector
-    if new in lst:
-        pos = f"{lst.index(new) + 1} / {len(lst)} in {scope} (sorted by ticker)"
-    else:
-        pos = f"{new} is not in {scope}; loading it anyway"
-    info = universe_info(new)
-    label = f"{new}  ·  {info['name']}  ·  {info['sector']}" if info["name"] else f"{new}  ·  not in the S&P 500 list"
-    return new, pos, new, label
-
-
-@app.callback(Output("fig-a", "figure"), Output("a-status", "children"),
-              Input("ticker-store", "data"), Input("kalshi-ticker", "value"))
-def update_fig_a(ticker, kalshi_ticker):
-    fig, err, kd = build_fig_a(ticker, kalshi_ticker)
-    if err:
-        msg = f"⚠ {ticker}: {err}"
-    else:
-        msg = (f"{ticker}: daily bars from 2024-06 (yfinance, backward-adjusted: first day fixed, later prices scaled by "
-               f"dividend/split factors).   {kalshi_ticker}: daily {kd['date'].min():%Y-%m-%d} – {kd['date'].max():%Y-%m-%d}, "
-               f"mid = (bid + ask) / 2 at the daily close.")
-    return fig, msg
-
-
-# ----------------------------------------------------------------------------- callbacks: event windows
-@app.callback(
-    Output("ev-text", "children"), Output("fig-ev", "figure"), Output("ev-summary", "data"),
-    Output("events-table", "columns"), Output("events-table", "data"), Output("events-table", "page_current"),
-    Output("events-table", "style_data_conditional"), Output("events-store", "data"),
-    Input("ticker-store", "data"), Input("kalshi-ticker", "value"), Input("k-thr", "value"), Input("k-mode", "value"),
-    Input("s-thr", "value"), Input("win-k", "value"),
-)
-def update_events(ticker, kalshi_ticker, k_thr, mode, s_thr, K):
-    try:
-        k_thr = float(k_thr or 3) / 100
-        s_thr = float(s_thr or 3) / 100
-        K = int(K or 2)
-        res = run_event_study(ticker, kalshi_ticker, k_thr=k_thr, s_thr=s_thr, K=K, mode=mode)
-    except Exception as e:  # noqa: BLE001
-        return f"⚠ {ticker}: {e}", go.Figure(), [], [], [], 0, [], {"rows": []}
-    ev = res["events"].copy()
-    rows = []
-    if not ev.empty:
-        ev["id"] = ev["date"]
-        ev["any_big_in_window"] = ev["any_big_in_window"].map({True: "yes", False: ""})
-        rows = ev.to_dict("records")
-    styles = []
-    for o in range(-K, K + 1):
-        c = f"ret_{o:+d}"
-        styles.append({"if": {"filter_query": f"{{{c}}} >= {s_thr} || {{{c}}} <= {-s_thr}", "column_id": c},
-                       "backgroundColor": "#fff1c2", "fontWeight": "bold"})
-    styles += [{"if": {"filter_query": "{direction} = up", "column_id": "direction"}, "color": C_UP},
-               {"if": {"filter_query": "{direction} = down", "column_id": "direction"}, "color": C_DOWN}]
-    summ = res["summary"].round(4).to_dict("records")
-    return (describe(res), build_fig_events(res["summary"], s_thr), summ,
-            event_table_columns(K), rows, 0, styles, {"rows": rows})
-
-
-@app.callback(
-    Output("fig-a", "figure", allow_duplicate=True),
-    Input("events-table", "active_cell"), State("events-store", "data"), prevent_initial_call=True,
-)
-def zoom_fig_a_to_event(cell, store):
-    if not cell or not store:
-        return no_update
-    d = cell.get("row_id")
-    if not d:
-        return no_update
-    d = pd.Timestamp(d)
-    patch = Patch()
-    patch["layout"]["xaxis"]["range"] = [str(d - pd.Timedelta(days=45)), str(d + pd.Timedelta(days=45))]
-    patch["layout"]["uirevision"] = f"evt-{d:%Y%m%d}"   # new uirevision, otherwise a user zoom would override the range
-    return patch
-
-
-# ----------------------------------------------------------------------------- callbacks: intraday
-@app.callback(
-    Output("day", "date"),
-    Input("fig-a", "clickData"), Input("prev-d", "n_clicks"), Input("next-d", "n_clicks"),
-    Input("prev-td", "n_clicks"), Input("next-td", "n_clicks"), Input("events-table", "active_cell"),
-    Input("kalshi-ticker", "value"),
-    State("day", "date"), prevent_initial_call=True,
-)
-def nav_day(click, _p, _n, _pt, _nt, ev_cell, kalshi_ticker, cur):
-    trig = ctx.triggered_id
-    cur = str(cur)[:10]
-    days, tdays = all_days(kalshi_ticker), trade_days(kalshi_ticker)
-    if trig == "kalshi-ticker":
-        return default_day(kalshi_ticker)
-    if trig == "events-table":
-        d = (ev_cell or {}).get("row_id")
-        return d if d and days[0] <= d <= days[-1] else no_update
-    if trig == "fig-a":
-        if not click:
-            return no_update
-        d = str(click["points"][0]["x"])[:10]
-        return d if days[0] <= d <= days[-1] else no_update
-    if trig in ("prev-d", "next-d"):
-        d = (date.fromisoformat(cur) + timedelta(days=1 if trig == "next-d" else -1)).isoformat()
-        return min(max(d, days[0]), days[-1])
-    if trig == "next-td":
-        i = bisect.bisect_right(tdays, cur)
-        return tdays[i] if i < len(tdays) else no_update
-    if trig == "prev-td":
-        i = bisect.bisect_left(tdays, cur) - 1
-        return tdays[i] if i >= 0 else no_update
-    return no_update
-
-
-@app.callback(
-    Output("fig-b", "figure"), Output("day-trades", "data"),
-    Output("trades-table", "data"), Output("trades-table", "page_current"), Output("day-info", "children"),
-    Input("day", "date"), Input("kalshi-ticker", "value"),
-)
-def update_day(day, kalshi_ticker):
-    day = str(day)[:10]
-    fig, m, t = build_fig_b(kalshi_ticker, day)
-    rows = table_rows(t)
-    n_contracts = float(t["count"].sum()) if not t.empty else 0.0
-    info = f"{kalshi_ticker} {day}: {len(m)} one-minute bars, {len(t)} trades, {n_contracts:,.0f} contracts"
-    return fig, {"day": day, "rows": rows}, rows, 0, info
-
-
-@app.callback(
-    Output("trades-table", "data", allow_duplicate=True),
-    Output("trades-table", "page_current", allow_duplicate=True),
-    Input("fig-b", "relayoutData"), State("day-trades", "data"), State("day", "date"),
-    prevent_initial_call=True,
-)
-def filter_table_by_view(relayout, store, day):
-    if not relayout or not store or store.get("day") != str(day)[:10]:
-        return no_update, no_update
-    rows = store["rows"]
-    # zoom/pan events may carry xaxis.range[0] or xaxis2.range[0] (shared axes); accept both
-    lo = hi = None
-    for ax in ("xaxis", "xaxis2"):
-        r0, r1 = relayout.get(f"{ax}.range[0]"), relayout.get(f"{ax}.range[1]")
-        if r0 is not None and r1 is not None:
-            lo, hi = pd.Timestamp(r0), pd.Timestamp(r1)
-            break
-        rng = relayout.get(f"{ax}.range")
-        if isinstance(rng, (list, tuple)) and len(rng) == 2:
-            lo, hi = pd.Timestamp(rng[0]), pd.Timestamp(rng[1])
-            break
-    if lo is None:
-        if any(relayout.get(f"{ax}.autorange") for ax in ("xaxis", "xaxis2")):
-            return rows, 0
-        return no_update, no_update
-    return [r for r in rows if lo <= pd.Timestamp(r["ts"]) <= hi], 0
-
-
-@app.callback(
-    Output("fig-b", "figure", allow_duplicate=True),
-    Input("trades-table", "active_cell"), State("day-trades", "data"), prevent_initial_call=True,
-)
-def center_on_trade(cell, store):
-    if not cell or not store:
-        return no_update
-    hit = next((r for r in store["rows"] if r["id"] == cell.get("row_id")), None)
-    if hit is None:
-        return no_update
-    ts = pd.Timestamp(hit["ts"])
-    rng = [str(ts - pd.Timedelta(minutes=10)), str(ts + pd.Timedelta(minutes=10))]
-    patch = Patch()
-    patch["layout"]["xaxis"]["range"] = rng
-    patch["layout"]["xaxis2"]["range"] = rng
-    return patch
-
+for module in (tab_pair, tab_stock, tab_live, tab_replay):
+    module.register(app)
 
 if __name__ == "__main__":
+    # Local run: start the order-book collector in a background thread so one command does everything.
+    # Set LIVE_COLLECTOR=0 to skip it (e.g. when live_collector.py already runs in another terminal).
+    # Under gunicorn (hosted) this block never executes, so the hosted app never polls Kalshi.
+    if os.environ.get("LIVE_COLLECTOR", "1").strip().lower() not in ("0", "false", "no"):
+        import threading
+
+        import live_collector
+
+        threading.Thread(target=live_collector.run, kwargs=dict(interval=10.0, depth=100),
+                         daemon=True, name="live-collector").start()
     app.run(debug=False, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8050")))
