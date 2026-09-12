@@ -49,6 +49,15 @@ if __name__ == "__main__":
 
         import live_collector
 
-        threading.Thread(target=live_collector.run, kwargs=dict(interval=10.0, depth=100),
-                         daemon=True, name="live-collector").start()
+        def _supervised():
+            # restart the collector if it ever exits or raises, so the dashboard keeps capturing
+            import time
+            while True:
+                try:
+                    live_collector.run(interval=10.0, depth=100)
+                except Exception as e:  # noqa: BLE001
+                    print(f"live collector crashed: {type(e).__name__}: {e} -- restarting in 5 s", flush=True)
+                time.sleep(5)
+
+        threading.Thread(target=_supervised, daemon=True, name="live-collector").start()
     app.run(debug=False, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8050")))

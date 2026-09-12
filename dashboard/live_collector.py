@@ -48,9 +48,24 @@ def fetch_book(session: requests.Session, ticker: str, depth: int) -> tuple[dict
 
 
 def atomic_write_json(path: Path, obj: dict) -> None:
+    """Write via a temp file and os.replace(). On Windows the replace fails with PermissionError while
+    another process/thread has the target open for reading (the dashboard reads latest.json every 10 s),
+    so retry briefly and finally fall back to an in-place write rather than let the collector die."""
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(obj), encoding="utf-8")
-    os.replace(tmp, path)
+    for _ in range(20):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    try:
+        path.write_text(json.dumps(obj), encoding="utf-8")     # non-atomic fallback; readers retry torn reads
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def run(interval: float = 10.0, depth: int = 100, tickers: list[str] | None = None, stop_event=None) -> None:
@@ -61,28 +76,37 @@ def run(interval: float = 10.0, depth: int = 100, tickers: list[str] | None = No
     LIVE_DIR.mkdir(parents=True, exist_ok=True)
     print(f"live collector: {len(tickers)} tickers, every {interval}s, depth {depth} -> {LIVE_DIR}", flush=True)
 
+    for stale in LIVE_DIR.glob("latest.*.tmp"):            # leftovers from an interrupted replace
+        try:
+            stale.unlink()
+        except OSError:
+            pass
     n_round = 0
     while stop_event is None or not stop_event.is_set():
         t_round = time.time()
         now = dt.datetime.now(dt.timezone.utc)
-        hour_file = LIVE_DIR / now.strftime("%Y-%m-%d") / (now.strftime("%H") + ".jsonl")
-        hour_file.parent.mkdir(parents=True, exist_ok=True)
-        latest = {"round": int(t_round), "round_ts": now.isoformat(timespec="milliseconds"), "books": {}}
-        with open(hour_file, "a", encoding="utf-8") as f:
-            for tk in tickers:
-                try:
-                    ob, lat = fetch_book(s, tk, depth)
-                    rec = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
-                           "round": int(t_round), "ticker": tk, "latency_ms": round(lat, 1), "orderbook_fp": ob}
-                    f.write(json.dumps(rec) + "\n")
-                    latest["books"][tk] = rec
-                except Exception as e:  # noqa: BLE001
-                    print(f"{now:%H:%M:%S} {tk} ERROR {e}", flush=True)
-        atomic_write_json(LATEST, latest)
-        n_round += 1
-        if n_round % 30 == 1:
-            print(f"{now:%Y-%m-%d %H:%M:%S}Z round {n_round}: {len(latest['books'])}/{len(tickers)} books, "
-                  f"{(time.time() - t_round) * 1000:.0f} ms", flush=True)
+        try:
+            hour_file = LIVE_DIR / now.strftime("%Y-%m-%d") / (now.strftime("%H") + ".jsonl")
+            hour_file.parent.mkdir(parents=True, exist_ok=True)
+            latest = {"round": int(t_round), "round_ts": now.isoformat(timespec="milliseconds"), "books": {}}
+            with open(hour_file, "a", encoding="utf-8") as f:
+                for tk in tickers:
+                    try:
+                        ob, lat = fetch_book(s, tk, depth)
+                        rec = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
+                               "round": int(t_round), "ticker": tk, "latency_ms": round(lat, 1), "orderbook_fp": ob}
+                        f.write(json.dumps(rec) + "\n")
+                        latest["books"][tk] = rec
+                    except Exception as e:  # noqa: BLE001
+                        print(f"{now:%H:%M:%S} {tk} ERROR {e}", flush=True)
+            if latest["books"]:
+                atomic_write_json(LATEST, latest)
+            n_round += 1
+            if n_round % 30 == 1:
+                print(f"{now:%Y-%m-%d %H:%M:%S}Z round {n_round}: {len(latest['books'])}/{len(tickers)} books, "
+                      f"{(time.time() - t_round) * 1000:.0f} ms", flush=True)
+        except Exception as e:  # noqa: BLE001  -- never let one bad round kill the collector
+            print(f"{now:%Y-%m-%d %H:%M:%S}Z round ERROR {type(e).__name__}: {e}", flush=True)
         time.sleep(max(0.0, interval - (time.time() - t_round)))
 
 
