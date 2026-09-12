@@ -11,9 +11,12 @@ cd dashboard
 python app.py                               # -> http://127.0.0.1:8050
 ```
 
-`python app.py` also starts the order-book collector in a background thread (every 10 s, depth 100,
-into `data/live/`). Set `LIVE_COLLECTOR=0` to skip it, or run `python live_collector.py` on its own
-when you want capture without the dashboard. Never run both at once: they would append to the same files.
+Order-book capture (every 10 s, depth 100, into `data/live/`) should run as its own process:
+`run_collector.cmd` (logs to `data/live/collector.log`), or the Windows scheduled task
+**KalshiLiveCollector** (runs `run_collector_hidden.vbs` at logon, restarts on failure). `python app.py`
+checks whether `data/live/latest.json` is being refreshed; only when nothing else is capturing does it
+start a collector thread of its own (`LIVE_COLLECTOR=1` forces it, `0` disables it). Never run two
+collectors at once: they would append to the same files.
 
 ## Tabs
 

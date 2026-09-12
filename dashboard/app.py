@@ -41,18 +41,30 @@ for module in (tab_pair, tab_stock, tab_live, tab_replay):
     module.register(app)
 
 if __name__ == "__main__":
-    # Local run: start the order-book collector in a background thread so one command does everything.
-    # Set LIVE_COLLECTOR=0 to skip it (e.g. when live_collector.py already runs in another terminal).
+    # Local run: LIVE_COLLECTOR=auto (default) starts the order-book collector in a background thread
+    # unless another collector is already writing data/live/latest.json (e.g. the scheduled task
+    # KalshiLiveCollector, see run_collector.cmd); "1" forces it on, "0" turns it off.
     # Under gunicorn (hosted) this block never executes, so the hosted app never polls Kalshi.
-    if os.environ.get("LIVE_COLLECTOR", "1").strip().lower() not in ("0", "false", "no"):
+    mode = os.environ.get("LIVE_COLLECTOR", "auto").strip().lower()
+    if mode not in ("0", "false", "no"):
         import threading
+        import time
 
         import live_collector
+        from live_data import LATEST
+
+        def _external_collector_alive(max_age_s: float = 45.0) -> bool:
+            try:
+                return (time.time() - LATEST.stat().st_mtime) < max_age_s
+            except OSError:
+                return False
 
         def _supervised():
-            # restart the collector if it ever exits or raises, so the dashboard keeps capturing
-            import time
+            # start (or restart) the collector whenever nothing else is capturing
             while True:
+                if mode != "1" and _external_collector_alive():
+                    time.sleep(30)
+                    continue
                 try:
                     live_collector.run(interval=10.0, depth=100)
                 except Exception as e:  # noqa: BLE001
