@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 from dash import Input, Output, State, ctx, dash_table, dcc, html, no_update
 
 from pair_data import events
-from replay_data import available_days, event_series, load_day
+from replay_data import event_series, exported_days, load_day
 from tab_live import C_D, C_R, C_TEXT, METRIC_COLS, TABLE_STYLE, ladder_figure, metrics_from_ladders
 
 NOTE = {"fontSize": "12px", "color": "#555", "margin": "4px 0"}
@@ -65,7 +65,7 @@ def with_marker(base: go.Figure, t: pd.Timestamp) -> go.Figure:
 
 
 def layout() -> html.Div:
-    days = available_days()
+    days = exported_days()
     return html.Div([
         html.Div(style=ROW, children=[
             html.B("Capture day (UTC):"),
@@ -93,12 +93,21 @@ def layout() -> html.Div:
         dcc.Graph(id="rp-daychart", config={"displaylogo": False}),
         dcc.Interval(id="rp-tick", interval=700, disabled=True),
         dcc.Store(id="rp-playing", data=False),
-        html.Div("No capture days yet: run the collector (python app.py starts it) and come back." if not days else "",
+        html.Div("No replay files yet: export captured days with  python replay_data.py  and reopen this tab." if not days else "",
                  style=NOTE),
     ])
 
 
 def register(app) -> None:
+    @app.callback(Output("rp-day", "options"), Output("rp-day", "value"),
+                  Input("tabs", "value"), State("rp-day", "value"))
+    def _refresh_days(tab, cur):
+        # re-read data/replay whenever the Replay tab is opened, so newly exported days appear without a restart
+        if tab != "replay":
+            return no_update, no_update
+        days = exported_days()
+        return [{"label": d, "value": d} for d in days], (cur if cur in days else (days[-1] if days else None))
+
     @app.callback(Output("rp-playing", "data"), Output("rp-tick", "disabled"), Output("rp-play", "children"),
                   Input("rp-play", "n_clicks"), State("rp-playing", "data"), prevent_initial_call=True)
     def _toggle(_n, playing):
